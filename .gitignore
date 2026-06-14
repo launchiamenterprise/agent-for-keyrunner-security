@@ -11,3 +11,4 @@ lambda-dist
 *.tar.gz
 .claude
 node_modules
+.env
