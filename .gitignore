@@ -12,3 +12,4 @@ lambda-dist
 .claude
 node_modules
 .env
+deployment/secret.yaml
