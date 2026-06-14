@@ -1,0 +1,8 @@
+.env
+node_modules
+*.ts
+*.json
+*.js
+webpack.config.js
+.claude
+!dist/agent.js

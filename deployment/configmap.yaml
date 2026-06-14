@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agent-test-config
+  namespace: test-agents
+data:
+  KR_MP_BASE_URL: 'https://mcp.keyrunner.app'
+  KR_WORKSPACE_ID: '674bfe9b845aec32492f33bc'
+  KR_VAULT_PROVIDER: 'aws'
+  AWS_REGION: 'us-west-2'
+  KR_AWS_SECRET_NAME: 'kcsv-demo/json-secret-demo'

@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-test
+  namespace: test-agents
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: agent-test
+  template:
+    metadata:
+      labels:
+        app: agent-test
+    spec:
+      serviceAccountName: agent-test
+
+      volumes:
+        - name: kr-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: keyrunner.app
+                  expirationSeconds: 3600
+                  path: token
+
+      containers:
+        - name: agent-test
+          image: 070274607150.dkr.ecr.us-west-2.amazonaws.com/agent-test:latest
+          imagePullPolicy: Always
+
+          envFrom:
+            - configMapRef:
+                name: agent-test-config
+            - secretRef:
+                name: agent-test-secrets
+
+          ports:
+            - containerPort: 3000
+
+          volumeMounts:
+            - mountPath: /var/run/kr
+              name: kr-token
+              readOnly: true
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 30
+            periodSeconds: 15
+
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+
+          resources:
+            requests:
+              cpu: '100m'
+              memory: '128Mi'
+            limits:
+              cpu: '500m'
+              memory: '256Mi'

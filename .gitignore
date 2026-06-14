@@ -1,0 +1,13 @@
+dist
+node_modules
+*.log
+secretScanResults
+.webpack-cache
+coverage
+.terraform
+.tfstate
+lambda-dist
+*.zip
+*.tar.gz
+.claude
+node_modules
