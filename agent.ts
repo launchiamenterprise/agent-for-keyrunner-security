@@ -1,129 +1,127 @@
-import Anthropic from "@anthropic-ai/sdk";
-import { KeyRunnerSDK } from "@launchiamenterprise/keyrunner-agentic-security";
-import * as dotenv from "dotenv";
-import * as http from "http";
-import * as readline from "readline";
+// ---------------------------------------------------------------------------
+// Security Intelligence & Remediation Agent — orchestrator / entry point.
+//
+//   Scheduler / HTTP  →  Research Agent  →  Risk Assessor (Claude)
+//                        →  Dedup gate    →  Action Agent (Slack + GitHub)
+//
+// v1: feeds + actions are called DIRECTLY (no KeyRunner SDK). The original
+// KeyRunner-SDK agent is preserved in agent.keyrunner.ts.bak for a future v2.
+// ---------------------------------------------------------------------------
+
+import Anthropic from '@anthropic-ai/sdk';
+import * as dotenv from 'dotenv';
+import * as http from 'http';
+import * as readline from 'readline';
+import { SecurityPipeline, type PipelineConfig } from './src/pipeline';
+import { DedupStore } from './src/dedup';
+import type { ScanReport } from './src/types';
 
 dotenv.config();
 
+const PORT = parseInt(process.env.PORT ?? '3000', 10);
+
+const num = (v: string | undefined, d: number): number => {
+  const n = v != null ? Number(v) : NaN;
+  return Number.isFinite(n) ? n : d;
+};
+
+// ── Config from env ───────────────────────────────────────────────────────────
+
+const slackWebhookUrl = process.env.SLACK_WEBHOOK_URL;
+const githubToken = process.env.GITHUB_TOKEN;
+const githubRepo = process.env.GITHUB_REPO; // "owner/repo"
+
+// Dry-run is OFF by default — the agent posts for real. Enable explicitly with DRY_RUN=true.
+const canPost = Boolean((githubToken && githubRepo) || slackWebhookUrl);
+const dryRun = (process.env.DRY_RUN ?? '').toLowerCase() === 'true';
+
+const pipelineConfig: PipelineConfig = {
+  research: {
+    nvdDays: num(process.env.NVD_DAYS, 1),
+    nvdLimit: num(process.env.NVD_LIMIT, 50),
+    ghAdvisoryCount: num(process.env.GH_ADVISORY_COUNT, 30),
+    maxEnrich: num(process.env.MAX_ENRICH, 12),
+    nvdApiKey: process.env.NVD_API_KEY,
+    githubToken,
+  },
+  action: {
+    slackWebhookUrl,
+    githubToken,
+    githubRepo,
+    issueLabels: (process.env.ISSUE_LABELS ?? 'security,vulnerability').split(',').map((s) => s.trim()).filter(Boolean),
+    dryRun,
+  },
+};
+
+const STATE_FILE = process.env.STATE_FILE ?? './.security-agent-state.json';
+const SCAN_INTERVAL_MINUTES = num(process.env.SCAN_INTERVAL_MINUTES, 360); // default: every 6 hours (0 = disabled)
+const SCAN_ON_START = (process.env.SCAN_ON_START ?? 'true').toLowerCase() === 'true'; // default: one scan at boot
+
 const anthropic = new Anthropic();
-const kr = new KeyRunnerSDK();
+const dedup = new DedupStore(STATE_FILE);
+const pipeline = new SecurityPipeline(anthropic, pipelineConfig, dedup);
 
-let tools: Anthropic.Tool[] = [];
-let ready = false;
-let initError: string | null = null;
+let scanning = false;
+let lastReport: ScanReport | null = null;
+let lastError: string | null = null;
 
-const PORT = parseInt(process.env.PORT ?? "3000", 10);
-
-// ---------------------------------------------------------------------------
-// Agent loop — returns the final text response
-// ---------------------------------------------------------------------------
-
-async function runAgent(userMessage: string, tools: Anthropic.Tool[]): Promise<string> {
-  console.log(`\n${"─".repeat(60)}`);
-  console.log(`You: ${userMessage}`);
-  console.log("─".repeat(60));
-
-  const messages: Anthropic.MessageParam[] = [
-    {
-      role: "user",
-      content: `The user said: "${userMessage}"\n\nDecide which Slack channel this belongs to and send it there.`,
-    },
-  ];
-
-  while (true) {
-    const response = await anthropic.messages.create({
-      model: "claude-sonnet-4-6",
-      max_tokens: 1024,
-      tools,
-      messages,
-    });
-
-    if (response.stop_reason === "end_turn") {
-      const text = response.content
-        .filter((b): b is Anthropic.TextBlock => b.type === "text")
-        .map((b) => b.text.trim())
-        .filter(Boolean)
-        .join("\n");
-      if (text) console.log(`\nAgent: ${text}`);
-      console.log("─".repeat(60));
-      return text;
-    }
-
-    if (response.stop_reason === "tool_use") {
-      const thinkingText = response.content
-        .filter((b): b is Anthropic.TextBlock => b.type === "text" && b.text.trim().length > 0)
-        .map((b) => b.text.trim())
-        .join("\n");
-      // Fall back to the user's original message so the audit always has context
-      const llmDirective = thinkingText || `User: ${userMessage}`;
-
-      if (thinkingText) console.log(`\n[thinking] ${thinkingText}`);
-
-      messages.push({ role: "assistant", content: response.content });
-      const toolResults: Anthropic.ToolResultBlockParam[] = [];
-
-      for (const block of response.content) {
-        if (block.type !== "tool_use") continue;
-
-        console.log(`\n[tool]   ${block.name}`);
-        console.log(`[args]   ${JSON.stringify(block.input)}`);
-
-        try {
-          const result = await kr.execute(block.name, block.input as Record<string, unknown>, { llmDirective });
-          console.log(`[status] ${result.status}`);
-          // console.log(`[result] ${result.body}`);
-          toolResults.push({ type: "tool_result", tool_use_id: block.id, content: result.body });
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          console.error(`[error]  ${msg}`);
-          toolResults.push({ type: "tool_result", tool_use_id: block.id, content: msg, is_error: true });
-        }
-      }
-
-      messages.push({ role: "user", content: toolResults });
-    }
+async function runScan(overrideDryRun?: boolean): Promise<ScanReport> {
+  if (scanning) throw new Error('a scan is already in progress');
+  scanning = true;
+  lastError = null;
+  const prevDryRun = pipelineConfig.action.dryRun;
+  if (overrideDryRun !== undefined) pipelineConfig.action.dryRun = overrideDryRun;
+  try {
+    lastReport = await pipeline.scan();
+    return lastReport;
+  } catch (err) {
+    lastError = err instanceof Error ? err.message : String(err);
+    throw err;
+  } finally {
+    pipelineConfig.action.dryRun = prevDryRun;
+    scanning = false;
   }
 }
 
-// ---------------------------------------------------------------------------
-// HTTP server — POST /chat, GET /health
-// ---------------------------------------------------------------------------
+// ── HTTP server — GET /health, POST /scan ──────────────────────────────────────
 
 function startHttpServer(): void {
   const server = http.createServer(async (req, res) => {
-    if (req.method === "GET" && req.url === "/health") {
-      // Liveness: always 200 so k8s doesn't restart the pod during slow SDK init
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "ok", ready, initError }));
+    if (req.method === 'GET' && req.url === '/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          status: 'ok',
+          scanning,
+          dryRun: pipelineConfig.action.dryRun,
+          slackConfigured: Boolean(slackWebhookUrl),
+          githubConfigured: Boolean(githubToken && githubRepo),
+          githubRepo: githubRepo ?? null,
+          lastScanAt: lastReport?.finishedAt ?? null,
+          lastError,
+        }),
+      );
       return;
     }
 
-    if (req.method === "POST" && req.url === "/chat") {
-      if (!ready) {
-        res.writeHead(503, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: initError ?? "SDK not ready yet" }));
+    if (req.method === 'POST' && req.url?.startsWith('/scan')) {
+      if (scanning) {
+        res.writeHead(409, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'scan already in progress' }));
         return;
       }
-      let body = "";
-      req.on("data", (chunk) => { body += chunk; });
-      req.on("end", async () => {
-        try {
-          const { message } = JSON.parse(body) as { message?: string };
-          if (!message) {
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "message is required" }));
-            return;
-          }
-          const reply = await runAgent(message, tools);
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ reply }));
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: msg }));
-        }
-      });
+      const url = new URL(req.url, `http://localhost:${PORT}`);
+      const dryOverride = url.searchParams.has('dryRun')
+        ? url.searchParams.get('dryRun') !== 'false'
+        : undefined;
+      try {
+        const report = await runScan(dryOverride);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(report, null, 2));
+      } catch (err) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
+      }
       return;
     }
 
@@ -132,77 +130,54 @@ function startHttpServer(): void {
   });
 
   server.listen(PORT, () => {
-    console.log(`[server] Listening on :${PORT}  — POST /chat  GET /health`);
+    console.log(`[server] listening on :${PORT}  — POST /scan  GET /health`);
   });
 }
 
-// ---------------------------------------------------------------------------
-// Local REPL — only when running interactively (not in k8s)
-// ---------------------------------------------------------------------------
+// ── Local REPL — press Enter to run a scan (only when interactive) ─────────────
 
 function startRepl(): void {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-
   const prompt = (): void => {
-    rl.question("\nYou: ", async (input) => {
-      const message = input.trim();
-      if (!message) { prompt(); return; }
-      if (message.toLowerCase() === "exit") {
-        kr.destroy();
-        rl.close();
-        return;
+    rl.question('\n[security-agent] press Enter to scan (or type "dry" / "exit"): ', async (input) => {
+      const cmd = input.trim().toLowerCase();
+      if (cmd === 'exit') { rl.close(); return; }
+      try {
+        await runScan(cmd === 'dry' ? true : undefined);
+      } catch (err) {
+        console.error('[repl] scan failed:', err instanceof Error ? err.message : String(err));
       }
-      await runAgent(message, tools);
       prompt();
     });
   };
-
-  console.log('\nAgent ready. Type a message and press Enter. Type "exit" to quit.');
   prompt();
 }
 
-// ---------------------------------------------------------------------------
-// Startup
-// ---------------------------------------------------------------------------
+// ── Startup ────────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
-  // Start HTTP server immediately so health probes pass during SDK init
   startHttpServer();
 
-  try {
-    console.log("[KeyRunner] Initializing SDK...");
-    await kr.init();
-    console.log("[KeyRunner] SDK ready.");
-
-    const applyTools = (krTools: Awaited<ReturnType<typeof kr.getTools>>) => {
-      tools = krTools.map((t) => ({
-        name: t.name,
-        description: t.description,
-        input_schema: t.inputSchema as Anthropic.Tool["input_schema"],
-      }));
-      ready = tools.length > 0;
-      initError = tools.length === 0 ? "No tools available — assign policies in the KeyRunner UI" : null;
-      console.log(`[KeyRunner] Tools updated (${tools.length}): ${tools.map((t) => t.name).join(", ") || "none"}`);
-    };
-
-    const krTools = await kr.getTools();
-    applyTools(krTools);
-
-    // Keep tools in sync whenever the UI adds/removes tools or policies
-    kr.onToolsChanged(applyTools);
-
-    if (process.stdin.isTTY && ready) {
-      startRepl();
-    }
-  } catch (err) {
-    initError = err instanceof Error ? err.message : String(err);
-    console.error("[KeyRunner] Init failed:", initError);
-    // Don't exit — keep the HTTP server alive so /health stays up
-    // and logs are visible via kubectl logs
+  console.log(`[config] dryRun=${dryRun}  slack=${Boolean(slackWebhookUrl)}  github=${Boolean(githubToken && githubRepo)}${githubRepo ? ` (${githubRepo})` : ''}`);
+  if (!dryRun && !canPost) {
+    console.warn('[config] DRY_RUN is off but no SLACK_WEBHOOK_URL or GITHUB_TOKEN+GITHUB_REPO is set — actions will error until you configure them.');
   }
+
+  if (SCAN_INTERVAL_MINUTES > 0) {
+    console.log(`[scheduler] scanning every ${SCAN_INTERVAL_MINUTES} minute(s)`);
+    setInterval(() => {
+      runScan().catch((err) => console.error('[scheduler] scan failed:', err instanceof Error ? err.message : String(err)));
+    }, SCAN_INTERVAL_MINUTES * 60 * 1000);
+  }
+
+  if (SCAN_ON_START) {
+    runScan().catch((err) => console.error('[startup] scan failed:', err instanceof Error ? err.message : String(err)));
+  }
+
+  if (process.stdin.isTTY) startRepl();
 }
 
 main().catch((err) => {
-  console.error("[Fatal]", err);
+  console.error('[Fatal]', err);
   process.exit(1);
 });
